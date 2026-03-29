@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minitorch"
+version = "0.0"
+dynamic = ["dependencies"]
+description = "A mini torch implementation with flash attention"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools]
+packages = ["minitorch"]

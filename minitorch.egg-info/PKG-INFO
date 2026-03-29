@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: minitorch
+Version: 0.0
+Summary: A mini torch implementation with flash attention
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: colorama==0.4.3
+Requires-Dist: hypothesis==6.148.7
+Requires-Dist: mypy==0.971
+Requires-Dist: numba==0.63.1
+Requires-Dist: numpy==2.3.5
+Requires-Dist: pre-commit==2.20.0
+Requires-Dist: pytest==9.0.2
+Requires-Dist: pytest-env
+Requires-Dist: pytest-runner==5.2
+Requires-Dist: typing_extensions
+Requires-Dist: pycuda==2025.1.2
+Requires-Dist: embeddings==0.0.8
+
+# Minitorch-flash-attention
+
