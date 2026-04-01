@@ -421,7 +421,89 @@ class MatMul(Function):
             grad_output.f.matrix_multiply(transpose(t1), grad_output),
         )
 
+class Cat(Function):
+    @staticmethod
+    def forward(ctx: Context, *tensors_and_dim) -> Tensor:
+        *tensors, dim_tensor = tensors_and_dim
+        dim = int(dim_tensor.item())
+        shapes = [t.shape for t in tensors]
+        ctx.save_for_backward(shapes, dim)
+        
+        # Use numpy for the actual concatenation
+        np_arrays = [t._tensor._storage.reshape(t.shape) for t in tensors]
+        result = np.concatenate(np_arrays, axis=dim)
+        return minitorch.Tensor.make(
+            result.flatten().tolist(), result.shape, backend=tensors[0].backend
+        )
 
+    @staticmethod
+    def backward(ctx: Context, grad_output: Tensor) -> Tuple[Tensor, ...]:
+        shapes, dim = ctx.saved_values
+        # Split gradient along the cat dimension
+        splits = [s[dim] for s in shapes]
+        grad_np = grad_output._tensor._storage.reshape(grad_output.shape)
+        grad_splits = np.split(grad_np, np.cumsum(splits)[:-1], axis=dim)
+        
+        grads = tuple(
+            minitorch.Tensor.make(
+                g.flatten().tolist(), shapes[i], backend=grad_output.backend
+            )
+            for i, g in enumerate(grad_splits)
+        )
+        return grads + (minitorch.Tensor.make([0.0], (1,), backend=grad_output.backend),)
+
+
+def cat(tensors, dim=0, backend=None):
+    if backend is None:
+        backend = tensors[0].backend
+    dim_tensor = minitorch.Tensor.make([float(dim)], (1,), backend=backend)
+    return Cat.apply(*tensors, dim_tensor)
+
+class Select(Function):
+    @staticmethod
+    def forward(ctx: Context, a: Tensor, dim: Tensor, index: Tensor) -> Tensor:
+        d = int(dim.item())
+        idx = int(index.item())
+
+        ctx.save_for_backward(a.shape, d, idx)
+
+        a_np = a.contiguous()._tensor._storage.reshape(a.shape)
+
+        slices = [slice(None)] * len(a.shape)
+        slices[d] = idx
+
+        out_np = np.ascontiguousarray(a_np[tuple(slices)].astype(datatype))
+
+        return minitorch.Tensor.make(
+            out_np.flatten(), tuple(out_np.shape), backend=a.backend
+        )
+
+    @staticmethod
+    def backward(ctx: Context, grad_output: Tensor):
+        a_shape, d, idx = ctx.saved_values
+
+        g = grad_output.contiguous()
+        grad_np = np.zeros(a_shape, dtype=datatype)
+
+        slices = [slice(None)] * len(a_shape)
+        slices[d] = idx
+
+        g_np = g._tensor._storage.reshape(grad_output.shape)
+        grad_np[tuple(slices)] = g_np
+
+        grad_np = np.ascontiguousarray(grad_np)
+
+        zero = minitorch.Tensor.make([0.0], (1,), backend=grad_output.backend)
+
+        return (
+            minitorch.Tensor.make(grad_np.flatten(), a_shape, backend=grad_output.backend),
+            zero,  # grad for dim (constant, no real gradient)
+            zero,  # grad for index (constant, no real gradient)
+        )
+    
+def select(a: Tensor, dim: int, index: int) -> Tensor: 
+    """Select a single index along dimension dim, removing that dimension.""" 
+    return Select.apply(a, tensor([dim]), tensor([index]))
 # Helpers for Constructing tensors
 def zeros(shape: UserShape, backend: TensorBackend = SimpleBackend) -> Tensor:
     """

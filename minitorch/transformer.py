@@ -14,14 +14,14 @@ from .nn import (
     dropout,
     GELU,
 )
-from .tensor_functions import (zeros, ones, rand)
+from .tensor_functions import (zeros, ones, rand,cat,select)
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 datatype = np.float32
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embd: int, n_head: int, causal: bool=True, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None):
         super().__init__()
         """Implements Multi-Head Attention as described in "Attention Is All You Need"
 
@@ -216,7 +216,7 @@ class TransformerLayer(Module):
         ### BEGIN ASSIGN3_3
         self.ln_1 = LayerNorm1d(n_embd,ln_eps,backend)
         self.ln_2 = LayerNorm1d(n_embd,ln_eps,backend)
-        self.attention = MultiHeadAttention(n_embd, n_head, True, p_dropout, bias, backend)
+        self.attention = MultiHeadAttention(n_embd, n_head, False, p_dropout, bias, backend)
         self.ff = FeedForward(n_embd,  4 * n_embd, p_dropout, bias, backend)
         ### END ASSIGN3_3
 
@@ -242,95 +242,95 @@ class TransformerLayer(Module):
         ### END YOUR SOLUTION
 
 
-# class DecoderLM(Module):
-#     def __init__(
-#         self, 
-#         n_vocab: int,
-#         n_embd: int,
-#         n_head: int,
-#         n_positions: int,
-#         p_dropout: float=0.1,
-#         ln_eps: float=1e-5, 
-#         bias: bool=True,
-#         backend: TensorBackend=None
-#     ):
-#         super().__init__()
-#         """
-#         Initialize a decoder-only transformer language model.
+class DecoderLM(Module):
+    def __init__(
+        self, 
+        n_vocab: int,
+        n_embd: int,
+        n_head: int,
+        n_positions: int,
+        p_dropout: float=0.1,
+        ln_eps: float=1e-5, 
+        bias: bool=True,
+        backend: TensorBackend=None
+    ):
+        super().__init__()
+        """
+        Initialize a decoder-only transformer language model.
         
-#         Args:
-#             n_vocab (int): Vocabulary size
-#             n_embd (int): Embedding dimension
-#             n_head (int): Number of attention heads
-#             n_positions (int): Maximum sequence length
-#             p_dropout (float): Dropout probability, default 0.1
-#             ln_eps (float): Layer normalization epsilon, default 1e-5
-#             bias (bool): Whether to use bias in linear layers, default True
-#             backend (TensorBackend): Backend for tensor operations
+        Args:
+            n_vocab (int): Vocabulary size
+            n_embd (int): Embedding dimension
+            n_head (int): Number of attention heads
+            n_positions (int): Maximum sequence length
+            p_dropout (float): Dropout probability, default 0.1
+            ln_eps (float): Layer normalization epsilon, default 1e-5
+            bias (bool): Whether to use bias in linear layers, default True
+            backend (TensorBackend): Backend for tensor operations
             
-#         Attributes:
-#             token_embeddings (Embedding): Token embedding layer
-#             position_embeddings (Embedding): Position embedding layer
-#             t_layer_1 (TransformerLayer): First transformer layer
-#             t_layer_2 (TransformerLayer): Second transformer layer
-#             t_layer_3 (TransformerLayer): Third transformer layer
-#             t_layer_4 (TransformerLayer): Fourth transformer layer
-#             dropout (Dropout): Dropout layer before transformer layers
-#             ln (LayerNorm1d): Final layer normalization
-#             lm_head (Linear): Language model head for vocabulary projection
-#         """
-#         self.backend = backend
-#         self.n_embd = n_embd
-#         self.n_vocab = n_vocab
-#         ### BEGIN ASSIGN3_3
-#         self.token_embeddings = Embedding(n_vocab, n_embd, backend)
-#         self.position_embeddings = Embedding(n_positions, n_embd, backend)
-#         self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-#         self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-#         self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-#         self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-#         self.dropout = Dropout(p_dropout)
-#         self.ln = LayerNorm1d(n_embd, ln_eps, backend)
-#         self.lm_head = Linear(n_embd, n_vocab, bias, backend)
-#         ### END ASSIGN3_3
+        Attributes:
+            token_embeddings (Embedding): Token embedding layer
+            position_embeddings (Embedding): Position embedding layer
+            t_layer_1 (TransformerLayer): First transformer layer
+            t_layer_2 (TransformerLayer): Second transformer layer
+            t_layer_3 (TransformerLayer): Third transformer layer
+            t_layer_4 (TransformerLayer): Fourth transformer layer
+            dropout (Dropout): Dropout layer before transformer layers
+            ln (LayerNorm1d): Final layer normalization
+            lm_head (Linear): Language model head for vocabulary projection
+        """
+        self.backend = backend
+        self.n_embd = n_embd
+        self.n_vocab = n_vocab
+        ### BEGIN ASSIGN3_3
+        self.token_embeddings = Embedding(n_vocab, n_embd, backend)
+        self.position_embeddings = Embedding(n_positions, n_embd, backend)
+        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
+        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
+        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
+        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
+        self.dropout = Dropout(p_dropout)
+        self.ln = LayerNorm1d(n_embd, ln_eps, backend)
+        self.lm_head = Linear(n_embd, n_vocab, bias, backend)
+        ### END ASSIGN3_3
     
-#     def forward(self, idx):
-#         """
-#         Forward pass through decoder-only transformer language model.
+    def forward(self, idx):
+        """
+        Forward pass through decoder-only transformer language model.
         
-#         Args:
-#             idx (Tensor): Input token indices of shape (batch_size, seq_len)
+        Args:
+            idx (Tensor): Input token indices of shape (batch_size, seq_len)
         
-#         Returns:
-#             Tensor: Logits of shape (batch_size, seq_len, n_vocab)
-#         """
+        Returns:
+            Tensor: Logits of shape (batch_size, seq_len, n_vocab)
+        """
         
-#         batch_size, seq_len = idx.shape
+        batch_size, seq_len = idx.shape
 
-#         ### BEGIN ASSIGN3_3
-#         # 1. Get token embeddings of shape (batch_size, seq_len, n_embd)
-#         # 2. Create positional embeddings of shape (1, seq_len, n_embd):
-#         #    - Create position ids tensor [0, 1, 2, ..., seq_len-1] of shape (1, seq_len)
-#         #    - Pass through positional embedding layer
-#         #    - Ensure output shape is (1, seq_len, n_embd)
-#         # 3. Add token and positional embeddings
-#         # 4. Apply dropout
-#         # 5. Pass through transformer layers (t_layer_1 to t_layer_4)
-#         # 6. Apply final layer normalization
-#         # 7. Project to vocabulary size using lm_head
-#         tok_embd = self.token_embeddings(idx)
-#         pos_ids = tensor( [list(range(seq_len))], backend=self.backend, requires_grad=False )
-#         pos_embd = self.position_embeddings(pos_ids)
-#         x = tok_embd + pos_embd
-#         x_dropout = self.dropout(x)
-#         trans_out = self.t_layer_1(x_dropout)
-#         trans_out = self.t_layer_2(trans_out)
-#         trans_out = self.t_layer_3(trans_out)
-#         trans_out = self.t_layer_4(trans_out)
-#         l_norm_out = self.ln(trans_out.view(batch_size*seq_len, self.n_embd)).view(batch_size, seq_len, self.n_embd)
-#         output  = self.lm_head(l_norm_out.view(batch_size*seq_len,self.n_embd)).view(batch_size, seq_len, self.n_vocab)
-#         return output
-#         ### END ASSIGN3_3
+        ### BEGIN ASSIGN3_3
+        # 1. Get token embeddings of shape (batch_size, seq_len, n_embd)
+        # 2. Create positional embeddings of shape (1, seq_len, n_embd):
+        #    - Create position ids tensor [0, 1, 2, ..., seq_len-1] of shape (1, seq_len)
+        #    - Pass through positional embedding layer
+        #    - Ensure output shape is (1, seq_len, n_embd)
+        # 3. Add token and positional embeddings
+        # 4. Apply dropout
+        # 5. Pass through transformer layers (t_layer_1 to t_layer_4)
+        # 6. Apply final layer normalization
+        # 7. Project to vocabulary size using lm_head
+        tok_embd = self.token_embeddings(idx)
+        pos_ids = tensor( [list(range(seq_len))], backend=self.backend, requires_grad=False )
+        pos_embd = self.position_embeddings(pos_ids)
+        x = tok_embd + pos_embd
+        x_dropout = self.dropout(x)
+        trans_out = self.t_layer_1(x_dropout)
+        trans_out = self.t_layer_2(trans_out)
+        trans_out = self.t_layer_3(trans_out)
+        trans_out = self.t_layer_4(trans_out)
+        l_norm_out = self.ln(trans_out.view(batch_size*seq_len, self.n_embd)).view(batch_size, seq_len, self.n_embd)
+        output  = self.lm_head(l_norm_out.view(batch_size*seq_len,self.n_embd)).view(batch_size, seq_len, self.n_vocab)
+        return output
+        ### END ASSIGN3_3
 
 class Patchify(Module):
     def __init__(self, patch_size):
@@ -415,13 +415,9 @@ class ViT(Module):
         print(x.shape)
         B, N, D = x.shape #B: batch size, N: number of patches, D: embedding dimension
         
-        cls_token = self.cls_token  # (1, 1, D)
-        cls_token = self.cls_token.value + zeros((B, 1, self.n_embd), backend=self.backend)  # (B, 1, D)
+        cls_token = self.cls_token.value + zeros((B, 1, self.n_embd), backend=self.backend)  # (1, 1, D)->(B, 1, D)
         
-        cls_np = cls_token.to_numpy()   # (B, 1, D)
-        x_np = x.to_numpy()             # (B, N, D)
-        x_combined = np.concatenate([cls_np, x_np], axis=1)  # (B, N+1, D)
-        x = tensor_from_numpy(x_combined, backend=self.backend)
+        x = cat([cls_token, x], dim=1, backend=self.backend)  # (B, N+1, D)
         num_patches = N + 1
 
         pos_ids = tensor([list(range(num_patches))], backend=self.backend, requires_grad=False)  # (1, N+1)
@@ -430,8 +426,6 @@ class ViT(Module):
         x = x + pos_enc
         for layer in self.trans_layers:
             x = layer(x)
-        x_np = x.to_numpy()  # (B, N+1, D)
-        cls_np = x_np[:, 0, :]  # (B, D)
-        x = tensor_from_numpy(cls_np, backend=self.backend)
+        x = select(x, dim=1, index=0)  # (B, D)
         x = self.lm_head(x)
         return x
