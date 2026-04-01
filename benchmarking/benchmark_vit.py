@@ -27,40 +27,8 @@ BATCH_SIZE = 2
 IMG_SIZE = 224
 
 HIDDEN_SIZES = [768]
-# IMG_SIZES = [256, 512, 1024, 2048]  # patches: 256, 1024, 4096, 16384
-IMG_SIZES = [64, 128, 256, 512]  
-
-
-def benchmark_forward_only(module, input_fn, n_iters=10, n_warmup=3):
-    """Benchmark only the forward pass (no backward) using the same memory poller."""
-    import time
-    import pycuda.autoinit
-
-    inp = input_fn()
-    for _ in range(n_warmup):
-        module(inp)
-
-    fwd_times = []
-    fwd_peak_mems = []
-
-    for _ in range(n_iters):
-        pycuda.autoinit.context.synchronize()
-
-        poller = bench_utils.NvmlMemPoller()
-        poller.start()
-        t0 = time.perf_counter()
-        out = module(inp)
-        pycuda.autoinit.context.synchronize()
-        t1 = time.perf_counter()
-        poller.stop()
-
-        fwd_times.append(t1 - t0)
-        fwd_peak_mems.append(poller.peak_mb)
-
-    return {
-        "fwd_time_ms": sum(fwd_times) / len(fwd_times) * 1000,
-        "fwd_peak_mem_mb": max(fwd_peak_mems),
-    }
+IMG_SIZES = [256, 512, 1024, 2048]  # patches: 256, 1024, 4096, 16384
+# IMG_SIZES = [64, 128, 256, 512]  
 
 
 def make_layers_for_img_size(img_sz):
@@ -130,7 +98,7 @@ def run_layer_breakdown():
     print("=" * 60)
 
     layer_names = None
-    # {img_sz: {layer_name: fwd_time_ms}}
+    # {img_sz: {layer_name: {fwd_time_ms, bwd_time_ms}}}
     all_results = {}
 
     for img_sz in IMG_SIZES:
@@ -144,38 +112,39 @@ def run_layer_breakdown():
         for name, (module, input_fn) in layers.items():
             module.train()
             print(f"    {name}...", end=" ", flush=True)
-            res = benchmark_forward_only(module, input_fn, n_iters=10, n_warmup=3)
-            all_results[img_sz][name] = res["fwd_time_ms"]
-            print(f"{res['fwd_time_ms']:.3f} ms")
+            res = bench_utils.benchmark_module(module, input_fn, n_iters=10, n_warmup=3)
+            all_results[img_sz][name] = res
+            print(f"fwd={res['fwd_time_ms']:.3f} ms  bwd={res['bwd_time_ms']:.3f} ms")
             del module, input_fn
         del layers
         gc.collect()
 
-    # Grouped bar chart: x-axis = image sizes, groups = layers
     n_groups = len(IMG_SIZES)
     n_bars = len(layer_names)
     bar_width = 0.8 / n_bars
     x = np.arange(n_groups)
-
     colors = plt.cm.tab10(np.linspace(0, 1, n_bars))
+    patch_labels = [f"{sz}x{sz}\n({(sz // PATCH_SIZE) ** 2} patches)" for sz in IMG_SIZES]
 
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig, (ax_fwd, ax_bwd) = plt.subplots(1, 2, figsize=(18, 7))
     fig.suptitle(f"ViT-Base/16 Layer Timing by Image Size (n_embd={N_EMBD}, patch={PATCH_SIZE})")
 
     for i, layer_name in enumerate(layer_names):
-        times = [all_results[img_sz][layer_name] for img_sz in IMG_SIZES]
         offset = (i - n_bars / 2 + 0.5) * bar_width
-        bars = ax.bar(x + offset, times, bar_width, label=layer_name, color=colors[i])
+        fwd_times = [all_results[img_sz][layer_name]["fwd_time_ms"] for img_sz in IMG_SIZES]
+        bwd_times = [all_results[img_sz][layer_name]["bwd_time_ms"] for img_sz in IMG_SIZES]
+        ax_fwd.bar(x + offset, fwd_times, bar_width, label=layer_name, color=colors[i])
+        ax_bwd.bar(x + offset, bwd_times, bar_width, label=layer_name, color=colors[i])
 
-    patch_labels = [f"{sz}x{sz}\n({(sz // PATCH_SIZE) ** 2} patches)" for sz in IMG_SIZES]
-    ax.set_xticks(x)
-    ax.set_xticklabels(patch_labels)
-    ax.set_xlabel("Image Size (patches)")
-    ax.set_ylabel("Forward Time (ms)")
-    ax.set_yscale("log")
-    ax.set_title("Per-Layer Forward Time")
-    ax.legend(loc="upper left")
-    ax.grid(True, axis="y", linestyle="--", alpha=0.5)
+    for ax, title in [(ax_fwd, "Forward Time"), (ax_bwd, "Backward Time")]:
+        ax.set_xticks(x)
+        ax.set_xticklabels(patch_labels)
+        ax.set_xlabel("Image Size (patches)")
+        ax.set_ylabel("Time (ms)")
+        ax.set_yscale("log")
+        ax.set_title(title)
+        ax.legend(loc="upper left")
+        ax.grid(True, axis="y", linestyle="--", alpha=0.5)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     save_path = "benchmarking/layers/vit_layer_breakdown.png"
@@ -310,38 +279,39 @@ def run_attention_breakdown():
         for name, (module, input_fn) in ops.items():
             module.train()
             print(f"    {name}...", end=" ", flush=True)
-            res = benchmark_forward_only(module, input_fn, n_iters=10, n_warmup=3)
-            all_results[img_sz][name] = res["fwd_time_ms"]
-            print(f"{res['fwd_time_ms']:.3f} ms")
+            res = bench_utils.benchmark_module(module, input_fn, n_iters=10, n_warmup=3)
+            all_results[img_sz][name] = res
+            print(f"fwd={res['fwd_time_ms']:.3f} ms  bwd={res['bwd_time_ms']:.3f} ms")
             del module, input_fn
         del ops
         gc.collect()
 
-    # Grouped bar chart
     n_groups = len(IMG_SIZES)
     n_bars = len(op_names)
     bar_width = 0.8 / n_bars
     x = np.arange(n_groups)
-
     colors = plt.cm.Set2(np.linspace(0, 1, n_bars))
+    patch_labels = [f"{sz}x{sz}\n({(sz // PATCH_SIZE) ** 2} patches)" for sz in IMG_SIZES]
 
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig, (ax_fwd, ax_bwd) = plt.subplots(1, 2, figsize=(18, 7))
     fig.suptitle(f"Attention Layer Breakdown by Image Size (n_embd={N_EMBD}, n_head={N_HEAD})")
 
     for i, op_name in enumerate(op_names):
-        times = [all_results[img_sz][op_name] for img_sz in IMG_SIZES]
         offset = (i - n_bars / 2 + 0.5) * bar_width
-        ax.bar(x + offset, times, bar_width, label=op_name, color=colors[i])
+        fwd_times = [all_results[img_sz][op_name]["fwd_time_ms"] for img_sz in IMG_SIZES]
+        bwd_times = [all_results[img_sz][op_name]["bwd_time_ms"] for img_sz in IMG_SIZES]
+        ax_fwd.bar(x + offset, fwd_times, bar_width, label=op_name, color=colors[i])
+        ax_bwd.bar(x + offset, bwd_times, bar_width, label=op_name, color=colors[i])
 
-    patch_labels = [f"{sz}x{sz}\n({(sz // PATCH_SIZE) ** 2} patches)" for sz in IMG_SIZES]
-    ax.set_xticks(x)
-    ax.set_xticklabels(patch_labels)
-    ax.set_xlabel("Image Size (patches)")
-    ax.set_ylabel("Forward Time (ms)")
-    ax.set_yscale("log")
-    ax.set_title("Per-Operation Forward Time (Single Attention Layer)")
-    ax.legend(loc="upper left")
-    ax.grid(True, axis="y", linestyle="--", alpha=0.5)
+    for ax, title in [(ax_fwd, "Forward Time"), (ax_bwd, "Backward Time")]:
+        ax.set_xticks(x)
+        ax.set_xticklabels(patch_labels)
+        ax.set_xlabel("Image Size (patches)")
+        ax.set_ylabel("Time (ms)")
+        ax.set_yscale("log")
+        ax.set_title(title)
+        ax.legend(loc="upper left")
+        ax.grid(True, axis="y", linestyle="--", alpha=0.5)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     save_path = "benchmarking/layers/vit_attention_breakdown.png"
