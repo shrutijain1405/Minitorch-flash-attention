@@ -14,14 +14,14 @@ from .nn import (
     dropout,
     GELU,
 )
-from .tensor_functions import (zeros, ones, rand)
+from .tensor_functions import (zeros, ones, rand,cat,select)
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 datatype = np.float32
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embd: int, n_head: int, causal: bool=True, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None):
         super().__init__()
         """Implements Multi-Head Attention as described in "Attention Is All You Need"
 
@@ -217,7 +217,7 @@ class TransformerLayer(Module):
         ### BEGIN ASSIGN3_3
         self.ln_1 = LayerNorm1d(n_embd,ln_eps,backend)
         self.ln_2 = LayerNorm1d(n_embd,ln_eps,backend)
-        self.attention = MultiHeadAttention(n_embd, n_head, causal, p_dropout, bias, backend)
+        self.attention = MultiHeadAttention(n_embd, n_head, False, p_dropout, bias, backend)
         self.ff = FeedForward(n_embd,  4 * n_embd, p_dropout, bias, backend)
         ### END ASSIGN3_3
 
@@ -286,10 +286,10 @@ class DecoderLM(Module):
         ### BEGIN ASSIGN3_3
         self.token_embeddings = Embedding(n_vocab, n_embd, backend)
         self.position_embeddings = Embedding(n_positions, n_embd, backend)
-        self.t_layer_1 = TransformerLayer(n_embd, n_head, True, p_dropout, ln_eps, bias, backend)
-        self.t_layer_2 = TransformerLayer(n_embd, n_head, True, p_dropout, ln_eps, bias, backend)
-        self.t_layer_3 = TransformerLayer(n_embd, n_head, True, p_dropout, ln_eps, bias, backend)
-        self.t_layer_4 = TransformerLayer(n_embd, n_head, True, p_dropout, ln_eps, bias, backend)
+        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
+        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
+        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
+        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
         self.dropout = Dropout(p_dropout)
         self.ln = LayerNorm1d(n_embd, ln_eps, backend)
         self.lm_head = Linear(n_embd, n_vocab, bias, backend)
@@ -413,13 +413,9 @@ class ViT(Module):
         x = self.patch_proj(x.view(B*N, D_in)).view(B, N, self.n_embd)  #(B, nH * nW, P^2 * C) -> (B, nH * nW, D)
         B, N, D = x.shape #B: batch size, N: number of patches, D: embedding dimension
         
-        cls_token = self.cls_token  # (1, 1, D)
-        cls_token = self.cls_token.value + zeros((B, 1, self.n_embd), backend=self.backend)  # (B, 1, D)
+        cls_token = self.cls_token.value + zeros((B, 1, self.n_embd), backend=self.backend)  # (1, 1, D)->(B, 1, D)
         
-        cls_np = cls_token.to_numpy()   # (B, 1, D)
-        x_np = x.to_numpy()             # (B, N, D)
-        x_combined = np.concatenate([cls_np, x_np], axis=1)  # (B, N+1, D)
-        x = tensor_from_numpy(x_combined, backend=self.backend)
+        x = cat([cls_token, x], dim=1, backend=self.backend)  # (B, N+1, D)
         num_patches = N + 1
 
         pos_ids = tensor([list(range(num_patches))], backend=self.backend, requires_grad=False)  # (1, N+1)
@@ -428,8 +424,6 @@ class ViT(Module):
         x = x + pos_enc
         for layer in self.trans_layers:
             x = layer(x)
-        x_np = x.to_numpy()  # (B, N+1, D)
-        cls_np = x_np[:, 0, :]  # (B, D)
-        x = tensor_from_numpy(cls_np, backend=self.backend)
+        x = select(x, dim=1, index=0)  # (B, D)
         x = self.lm_head(x)
         return x
