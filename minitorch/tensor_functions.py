@@ -391,6 +391,76 @@ class View(Function):
         )
 
 
+# class Cat(Function):
+#     @staticmethod
+#     def forward(ctx: Context, a: Tensor, b: Tensor, dim: Tensor) -> Tensor:
+#         d = int(dim[0])
+#         ctx.save_for_backward(a.shape, b.shape, d)
+
+#         a_np = a.contiguous()._tensor._storage.reshape(a.shape)
+#         b_np = b.contiguous()._tensor._storage.reshape(b.shape)
+#         out_np = np.concatenate([a_np, b_np], axis=d).astype(datatype)
+#         out_np = np.ascontiguousarray(out_np)
+
+#         return minitorch.Tensor.make(
+#             out_np.flatten(), tuple(out_np.shape), backend=a.backend
+#         )
+
+#     @staticmethod
+#     def backward(ctx: Context, grad_output: Tensor) -> Tuple[Tensor, Tensor, float]:
+#         a_shape, b_shape, d = ctx.saved_values
+#         g = grad_output.contiguous()
+#         g_np = g._tensor._storage.reshape(grad_output.shape)
+
+#         split = a_shape[d]
+#         slices_a = [slice(None)] * len(a_shape)
+#         slices_a[d] = slice(0, split)
+#         slices_b = [slice(None)] * len(b_shape)
+#         slices_b[d] = slice(split, split + b_shape[d])
+
+#         ga_np = np.ascontiguousarray(g_np[tuple(slices_a)].astype(datatype))
+#         gb_np = np.ascontiguousarray(g_np[tuple(slices_b)].astype(datatype))
+
+#         ga = minitorch.Tensor.make(ga_np.flatten(), a_shape, backend=grad_output.backend)
+#         gb = minitorch.Tensor.make(gb_np.flatten(), b_shape, backend=grad_output.backend)
+#         return ga, gb, 0.0
+
+
+# class Select(Function):
+#     @staticmethod
+#     def forward(ctx: Context, a: Tensor, dim: Tensor, index: Tensor) -> Tensor:
+#         d = int(dim[0])
+#         idx = int(index[0])
+#         ctx.save_for_backward(a.shape, d, idx)
+
+#         a_np = a.contiguous()._tensor._storage.reshape(a.shape)
+#         slices = [slice(None)] * len(a.shape)
+#         slices[d] = idx
+#         out_np = np.ascontiguousarray(a_np[tuple(slices)].astype(datatype))
+
+#         return minitorch.Tensor.make(
+#             out_np.flatten(), tuple(out_np.shape), backend=a.backend
+#         )
+
+#     @staticmethod
+#     def backward(ctx: Context, grad_output: Tensor) -> Tuple[Tensor, float, float]:
+#         a_shape, d, idx = ctx.saved_values
+#         g = grad_output.contiguous()
+
+#         grad_np = np.zeros(a_shape, dtype=datatype)
+#         slices = [slice(None)] * len(a_shape)
+#         slices[d] = idx
+#         g_np = g._tensor._storage.reshape(grad_output.shape)
+#         grad_np[tuple(slices)] = g_np
+
+#         grad_np = np.ascontiguousarray(grad_np)
+#         return (
+#             minitorch.Tensor.make(grad_np.flatten(), a_shape, backend=grad_output.backend),
+#             0.0,
+#             0.0,
+#         )
+
+
 class Copy(Function):
     @staticmethod
     def forward(ctx: Context, a: Tensor) -> Tensor:
@@ -420,6 +490,16 @@ class MatMul(Function):
             grad_output.f.matrix_multiply(grad_output, transpose(t2)),
             grad_output.f.matrix_multiply(transpose(t1), grad_output),
         )
+
+
+# def cat(a: Tensor, b: Tensor, dim: int = 0) -> Tensor:
+#     """Concatenate two tensors along dimension `dim`."""
+#     return Cat.apply(a, b, tensor([dim]))
+
+
+# def select(a: Tensor, dim: int, index: int) -> Tensor:
+#     """Select a single index along dimension `dim`, removing that dimension."""
+#     return Select.apply(a, tensor([dim]), tensor([index]))
 
 
 # Helpers for Constructing tensors

@@ -194,7 +194,7 @@ class FeedForward(Module):
     
 
 class TransformerLayer(Module):
-    def __init__(self, n_embd: int, n_head: int, p_dropout: float=0.1, ln_eps: float=1e-5, bias: bool=True, backend: TensorBackend=None):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=True, p_dropout: float=0.1, ln_eps: float=1e-5, bias: bool=True, backend: TensorBackend=None):
         super().__init__()
         """
         Initialize a transformer layer with pre-layer normalization.
@@ -202,6 +202,7 @@ class TransformerLayer(Module):
         Args:
             n_embd (int): Embedding dimension
             n_head (int): Number of attention heads
+            causal (bool): Whether to apply causal masking in attention, default True
             p_dropout (float): Dropout probability, default 0.1
             ln_eps (float): Layer normalization epsilon, default 1e-5
             bias (bool): Whether to use bias in linear layers, default True
@@ -216,7 +217,7 @@ class TransformerLayer(Module):
         ### BEGIN ASSIGN3_3
         self.ln_1 = LayerNorm1d(n_embd,ln_eps,backend)
         self.ln_2 = LayerNorm1d(n_embd,ln_eps,backend)
-        self.attention = MultiHeadAttention(n_embd, n_head, True, p_dropout, bias, backend)
+        self.attention = MultiHeadAttention(n_embd, n_head, causal, p_dropout, bias, backend)
         self.ff = FeedForward(n_embd,  4 * n_embd, p_dropout, bias, backend)
         ### END ASSIGN3_3
 
@@ -285,10 +286,10 @@ class DecoderLM(Module):
         ### BEGIN ASSIGN3_3
         self.token_embeddings = Embedding(n_vocab, n_embd, backend)
         self.position_embeddings = Embedding(n_positions, n_embd, backend)
-        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
+        self.t_layer_1 = TransformerLayer(n_embd, n_head, True, p_dropout, ln_eps, bias, backend)
+        self.t_layer_2 = TransformerLayer(n_embd, n_head, True, p_dropout, ln_eps, bias, backend)
+        self.t_layer_3 = TransformerLayer(n_embd, n_head, True, p_dropout, ln_eps, bias, backend)
+        self.t_layer_4 = TransformerLayer(n_embd, n_head, True, p_dropout, ln_eps, bias, backend)
         self.dropout = Dropout(p_dropout)
         self.ln = LayerNorm1d(n_embd, ln_eps, backend)
         self.lm_head = Linear(n_embd, n_vocab, bias, backend)
@@ -383,7 +384,6 @@ class ViT(Module):
         self.p_dropout = p_dropout
         self.ln_eps = ln_eps
         self.bias = bias
-        self.backend = backend
         self.patch_size = patch_size
         self.max_patches = max_patches
         self.patchify = Patchify(self.patch_size)
@@ -394,7 +394,7 @@ class ViT(Module):
         self.trans_layers = []
         for i in range(n_trans_layers):
             layer = TransformerLayer(
-                n_embd, n_head, p_dropout, ln_eps, bias, backend
+                n_embd, n_head, False, p_dropout, ln_eps, bias, backend
             )
             self.trans_layers.append(layer)
 
@@ -410,9 +410,7 @@ class ViT(Module):
         assert H % self.patch_size == 0 and W % self.patch_size == 0, "Image dimensions must be divisible by patch size"
         x = self.patchify(x)  #(B, C, nH, nW) -> (B, nH * nW, P^2 * C)
         B, N, D_in = x.shape    
-        print(B, N, D_in)
         x = self.patch_proj(x.view(B*N, D_in)).view(B, N, self.n_embd)  #(B, nH * nW, P^2 * C) -> (B, nH * nW, D)
-        print(x.shape)
         B, N, D = x.shape #B: batch size, N: number of patches, D: embedding dimension
         
         cls_token = self.cls_token  # (1, 1, D)

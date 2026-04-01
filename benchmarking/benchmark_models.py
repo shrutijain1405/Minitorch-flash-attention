@@ -21,32 +21,32 @@ def run_benchmarks():
     results = {}
     
     models = {
-        "DecoderLM": lambda hs: (
-            DecoderLM(
-                n_vocab=N_VOCAB,
-                n_embd=hs,
-                n_head=N_HEAD,
-                n_positions=SEQ_LEN,
-                p_dropout=0.1,
-                ln_eps=1e-5,
-                bias=True,
-                backend=backend
-            ),
-            lambda: minitorch.tensor_from_numpy(np.random.randint(0, N_VOCAB, (BATCH_SIZE, SEQ_LEN)), backend=backend)
-        ),
-        # "ViT": lambda hs: (
-        #     ViT(
+        # "DecoderLM": lambda hs: (
+        #     DecoderLM(
+        #         n_vocab=N_VOCAB,
         #         n_embd=hs,
         #         n_head=N_HEAD,
-        #         n_trans_layers=4,
-        #         patch_size=16,
-        #         n_classes=10,
-        #         max_patches=256,
-        #         n_channels=3,
+        #         n_positions=SEQ_LEN,
+        #         p_dropout=0.1,
+        #         ln_eps=1e-5,
+        #         bias=True,
         #         backend=backend
         #     ),
-        #     lambda: minitorch.tensor_from_numpy(np.random.randn(BATCH_SIZE, 3, 64, 64).astype(np.float32), backend=backend)
-        # )
+        #     lambda: minitorch.tensor_from_numpy(np.random.randint(0, N_VOCAB, (BATCH_SIZE, SEQ_LEN)), backend=backend)
+        # ),
+        "ViT": lambda hs: (
+            ViT(
+                n_embd=hs,
+                n_head=N_HEAD,
+                n_trans_layers=4,
+                patch_size=16,
+                n_classes=10,
+                max_patches=256,
+                n_channels=3,
+                backend=backend
+            ),
+            lambda: minitorch.tensor_from_numpy(np.random.randn(BATCH_SIZE, 3, 64, 64).astype(np.float32), backend=backend)
+        )
     }
 
     for name, factory in models.items():
