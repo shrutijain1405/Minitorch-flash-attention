@@ -14,6 +14,7 @@ from .nn import (
     dropout,
     GELU,
 )
+from .tensor_functions import (zeros, ones, rand)
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 datatype = np.float32
@@ -348,11 +349,15 @@ class Patchify(Module):
 
         nH = H // P
         nW = W // P
-        x = x.reshape(B, C, nH, P, nW, P)
-        x = x.permute(0, 2, 4, 1, 3, 5)
-        # (B, nH, nW, C, P, P)
-        x = x.reshape(B, nH * nW, C * P * P)
+        # print(nH, nW, P)
+        x = x.view(B, C, nH, P, nW, P)
+        # print(x.shape)
+        x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
+        # print(x.shape)
 
+        # (B, nH, nW, C, P, P)  
+        x = x.view(B, nH * nW, C * P * P)
+        # print(x.shape)
         return x
 
         
@@ -403,22 +408,30 @@ class ViT(Module):
         """
         B, C, H, W = x.shape
         assert H % self.patch_size == 0 and W % self.patch_size == 0, "Image dimensions must be divisible by patch size"
-        x = self.patchify(x)    #(B, C, nH, nW) -> (B, nH * nW, P^2 * C)
-        x = self.patch_proj(x)  #(B, nH * nW, P^2 * C) -> (B, nH * nW, D)
+        x = self.patchify(x)  #(B, C, nH, nW) -> (B, nH * nW, P^2 * C)
+        B, N, D_in = x.shape    
+        print(B, N, D_in)
+        x = self.patch_proj(x.view(B*N, D_in)).view(B, N, self.n_embd)  #(B, nH * nW, P^2 * C) -> (B, nH * nW, D)
+        print(x.shape)
         B, N, D = x.shape #B: batch size, N: number of patches, D: embedding dimension
+        
         cls_token = self.cls_token  # (1, 1, D)
-        cls_token = cls_token.repeat(B, 1, 1)  # (B, 1, D)
-        temp = zeros((B, N + 1, D), backend=self.backend)
-        temp[:, 0:1, :] = cls_token
-        temp[:, 1:, :] = x
-        x = temp
-        num_patches = N+1
-        pos_ids = tensor( [list(range(num_patches))], backend=self.backend, requires_grad=False )#(1, N+1)
-        pos_enc = self.position_embeddings(pos_ids)
-        pos_enc = pos_enc.repeat(B, 1, 1)
+        cls_token = self.cls_token.value + zeros((B, 1, self.n_embd), backend=self.backend)  # (B, 1, D)
+        
+        cls_np = cls_token.to_numpy()   # (B, 1, D)
+        x_np = x.to_numpy()             # (B, N, D)
+        x_combined = np.concatenate([cls_np, x_np], axis=1)  # (B, N+1, D)
+        x = tensor_from_numpy(x_combined, backend=self.backend)
+        num_patches = N + 1
+
+        pos_ids = tensor([list(range(num_patches))], backend=self.backend, requires_grad=False)  # (1, N+1)
+        pos_enc = self.position_embeddings(pos_ids)  # (1, N+1, D)
+        pos_enc = pos_enc + zeros((B, num_patches, self.n_embd), backend=self.backend)  # (B, N+1, D)
         x = x + pos_enc
         for layer in self.trans_layers:
             x = layer(x)
-        x = x[:, 0, :]  # (B, D)
+        x_np = x.to_numpy()  # (B, N+1, D)
+        cls_np = x_np[:, 0, :]  # (B, D)
+        x = tensor_from_numpy(cls_np, backend=self.backend)
         x = self.lm_head(x)
         return x
