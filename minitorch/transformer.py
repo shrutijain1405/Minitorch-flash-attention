@@ -410,9 +410,7 @@ class ViT(Module):
         assert H % self.patch_size == 0 and W % self.patch_size == 0, "Image dimensions must be divisible by patch size"
         x = self.patchify(x)  #(B, C, nH, nW) -> (B, nH * nW, P^2 * C)
         B, N, D_in = x.shape    
-        print(B, N, D_in)
         x = self.patch_proj(x.view(B*N, D_in)).view(B, N, self.n_embd)  #(B, nH * nW, P^2 * C) -> (B, nH * nW, D)
-        print(x.shape)
         B, N, D = x.shape #B: batch size, N: number of patches, D: embedding dimension
         
         cls_token = self.cls_token.value + zeros((B, 1, self.n_embd), backend=self.backend)  # (1, 1, D)->(B, 1, D)

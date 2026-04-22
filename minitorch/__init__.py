@@ -28,4 +28,16 @@ from .testing import MathTest, MathTestVariable  # type: ignore # noqa: F401,F40
 # ASSIGNMENT 2
 from .transformer import *
 
+# Flash Attention 1 modules
+from .flash_transformer import (   # noqa: F401
+    FlashMultiHeadAttention,
+    FlashTransformerLayer,
+    FlashViT,
+)
+from .flash_attention_ops import (  # noqa: F401
+    flash_attention,
+    flash_attn_available,
+    FA_D_MAX,
+)
+
 version = "0.4"
