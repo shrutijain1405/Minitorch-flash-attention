@@ -748,18 +748,16 @@ def ones_tensor_from_numpy(shape, backend: TensorBackend = SimpleBackend):
 # Gradient check for tensors
 
 
-import torch
-
 def grad_central_difference(
     f: Any, *vals: Tensor, arg: int = 0, epsilon: float = 1e-6, ind: UserIndex
 ) -> float:
+    import torch  # optional dependency — only needed for grad_check
     x = vals[arg]
     up_np = np.zeros(x.shape, dtype=np.float64)
     up_np[ind] = epsilon
     vals1 = [torch.tensor(x.to_numpy().astype(np.float64)) if j != arg else torch.tensor(x.to_numpy().astype(np.float64) + up_np) for j, x in enumerate(vals)]
     vals2 = [torch.tensor(x.to_numpy().astype(np.float64)) if j != arg else torch.tensor(x.to_numpy().astype(np.float64) - up_np) for j, x in enumerate(vals)]
     delta = float(f(*vals1).sum() - f(*vals2).sum().numpy())
-    # print(f"Debug in grad_central_difference: delta {delta}")
     return delta / (2.0 * epsilon)
 
 
