@@ -7,6 +7,7 @@ _flash_attn_available = False
 try:
     if numba.cuda.is_available():
         from .cuda_kernel_ops import CudaKernelOps as _CudaKernelOps
+        from .flash_attention_fn import FlashAttentionFn as _FlashAttentionFn
         _flash_attn_available = True
 except Exception:
     pass
@@ -134,7 +135,7 @@ class MultiHeadAttention(Module):
             q_flat = q.contiguous().view(BH, queries_len, q_dim)
             k_flat = k.contiguous().view(BH, queries_len, q_dim)
             v_flat = v.contiguous().view(BH, queries_len, q_dim)
-            out = _CudaKernelOps.flash_attention_forward(q_flat, k_flat, v_flat, q_dim ** -0.5)
+            out = _FlashAttentionFn.apply(q_flat, k_flat, v_flat)
             out = out.view(batch_size, num_head, queries_len, q_dim)
             out = out.permute(0, 2, 1, 3).contiguous()
             return out.view(batch_size, queries_len, num_head * q_dim)

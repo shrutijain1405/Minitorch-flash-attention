@@ -23,7 +23,8 @@ import pycuda.driver as cuda
 
 # Load the shared libraries
 lib = ctypes.CDLL("minitorch/cuda_kernels/combine.so")
-lib_fa = ctypes.CDLL("minitorch/cuda_kernels/flash_attention_forward.so")
+lib_fa_fwd = ctypes.CDLL("minitorch/cuda_kernels/flash_attention_forward.so")
+lib_fa_bwd = ctypes.CDLL("minitorch/cuda_kernels/flash_attention_backward.so")
 datatype = np.float32
 
 # function map
@@ -371,42 +372,174 @@ class CudaKernelOps(TensorOps):
         return out
 
     @staticmethod
-    def flash_attention_forward(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
+    def flash_attention_forward_fa2(q: Tensor, k: Tensor, v: Tensor, scale: float):
         """
-        Flash Attention forward pass (d=64 fixed).
+        Flash Attention 2 forward pass — outer Q, inner K/V, deferred normalization.
+
+        Q is loaded once into registers per block; O is normalized only at the end.
+        Grid: (BH, Tr) — Q tiles parallelized across blocks.
 
         Args:
             q, k, v : contiguous tensors of shape (BH, N, 64)
-                      where BH = batch_size * num_heads
             scale   : 1 / sqrt(d), precomputed
 
         Returns:
-            out : tensor of shape (BH, N, 64)
+            (out, L) : out is (BH, N, 64), L is (BH, N) logsumexp
         """
         assert len(q.shape) == 3 and q.shape[2] == 64, \
-            f"flash_attention_forward expects (BH, N, 64), got {q.shape}"
+            f"flash_attention_forward_fa2 expects (BH, N, 64), got {q.shape}"
 
-        BH, N, d = q.shape
+        BH, N, _ = q.shape
         out = q.zeros(q.shape)
+        # L is a flat 1-D storage of shape (BH*N,) — wrap as a 2-D tensor after the call
+        l_storage = np.zeros(BH * N, dtype=datatype)
 
-        lib_fa.flashAttentionForward.argtypes = [
+        lib_fa_fwd.flashAttentionForwardFA2.argtypes = [
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # Q
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # K
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # V
             np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # O
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # L
             ctypes.c_int,    # BH
             ctypes.c_int,    # N
             ctypes.c_float,  # scale
         ]
-        lib_fa.flashAttentionForward.restype = None
+        lib_fa_fwd.flashAttentionForwardFA2.restype = None
 
-        lib_fa.flashAttentionForward(
+        lib_fa_fwd.flashAttentionForwardFA2(
             q._tensor._storage,
             k._tensor._storage,
             v._tensor._storage,
             out._tensor._storage,
-            BH,
-            N,
-            scale,
+            l_storage,
+            BH, N, scale,
         )
-        return out
+        from .tensor_functions import tensor_from_numpy
+        L = tensor_from_numpy(l_storage.reshape(BH, N), backend=q.backend)
+        return out, L
+
+    @staticmethod
+    def flash_attention_forward_fa1(q: Tensor, k: Tensor, v: Tensor, scale: float):
+        """
+        Flash Attention 1 forward pass — original loop order (outer K/V, inner Q).
+
+        O is normalized at every K/V step and written back to HBM after each Q tile.
+        Uses more HBM bandwidth than FA2 but matches Algorithm 1 of the original paper.
+
+        Args:
+            q, k, v : contiguous tensors of shape (BH, N, 64)
+            scale   : 1 / sqrt(d), precomputed
+
+        Returns:
+            (out, L) : out is (BH, N, 64), L is (BH, N) logsumexp
+        """
+        assert len(q.shape) == 3 and q.shape[2] == 64, \
+            f"flash_attention_forward_fa1 expects (BH, N, 64), got {q.shape}"
+
+        BH, N, _ = q.shape
+        out = q.zeros(q.shape)
+        l_storage = np.zeros(BH * N, dtype=datatype)
+
+        lib_fa_fwd.flashAttentionForwardFA1.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # Q
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # K
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # V
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # O
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # L
+            ctypes.c_int,    # BH
+            ctypes.c_int,    # N
+            ctypes.c_float,  # scale
+        ]
+        lib_fa_fwd.flashAttentionForwardFA1.restype = None
+
+        lib_fa_fwd.flashAttentionForwardFA1(
+            q._tensor._storage,
+            k._tensor._storage,
+            v._tensor._storage,
+            out._tensor._storage,
+            l_storage,
+            BH, N, scale,
+        )
+        from .tensor_functions import tensor_from_numpy
+        L = tensor_from_numpy(l_storage.reshape(BH, N), backend=q.backend)
+        return out, L
+
+    @staticmethod
+    def flash_attention_backward_fa1(
+        q: Tensor, k: Tensor, v: Tensor,
+        o: Tensor, do: Tensor, l: Tensor,
+        scale: float,
+    ):
+        """
+        FA1 backward: outer K/V blocks, atomicAdd for dQ (d=64 fixed).
+        """
+        BH, N, _ = q.shape
+        dq = q.zeros(q.shape)
+        dk = q.zeros(q.shape)
+        dv = q.zeros(q.shape)
+
+        l_flat = l._tensor._storage
+
+        _argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # Q
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # K
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # V
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # O
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # dO
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # L
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # dQ
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # dK
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # dV
+            ctypes.c_int, ctypes.c_int, ctypes.c_float,
+        ]
+        lib_fa_bwd.flashAttentionBackwardFA1.argtypes = _argtypes
+        lib_fa_bwd.flashAttentionBackwardFA1.restype = None
+
+        lib_fa_bwd.flashAttentionBackwardFA1(
+            q._tensor._storage, k._tensor._storage, v._tensor._storage,
+            o._tensor._storage, do._tensor._storage, l_flat,
+            dq._tensor._storage, dk._tensor._storage, dv._tensor._storage,
+            BH, N, scale,
+        )
+        return dq, dk, dv
+
+    @staticmethod
+    def flash_attention_backward_fa2(
+        q: Tensor, k: Tensor, v: Tensor,
+        o: Tensor, do: Tensor, l: Tensor,
+        scale: float,
+    ):
+        """
+        FA2 backward: two-kernel split, no atomicAdd (d=64 fixed).
+        DKV kernel (outer K/V) computes dK and dV.
+        DQ  kernel (outer Q)   computes dQ.
+        """
+        BH, N, _ = q.shape
+        dq = q.zeros(q.shape)
+        dk = q.zeros(q.shape)
+        dv = q.zeros(q.shape)
+
+        l_flat = l._tensor._storage
+
+        _argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # Q
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # K
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # V
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # O
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # dO
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # L
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # dQ
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # dK
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # dV
+            ctypes.c_int, ctypes.c_int, ctypes.c_float,
+        ]
+        lib_fa_bwd.flashAttentionBackwardFA2.argtypes = _argtypes
+        lib_fa_bwd.flashAttentionBackwardFA2.restype = None
+
+        lib_fa_bwd.flashAttentionBackwardFA2(
+            q._tensor._storage, k._tensor._storage, v._tensor._storage,
+            o._tensor._storage, do._tensor._storage, l_flat,
+            dq._tensor._storage, dk._tensor._storage, dv._tensor._storage,
+            BH, N, scale,
+        )
+        return dq, dk, dv

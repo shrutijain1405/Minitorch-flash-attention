@@ -1,0 +1,289 @@
+"""
+Benchmark: Standard Attention vs Flash Attention (layer-level + kernel-level)
+
+Layer-level: sweeps sequence length N through MultiHeadAttention with
+  use_flash_attn=False vs True, reporting fwd/bwd time and peak GPU memory.
+
+Kernel-level: directly times the four raw kernels:
+  FA1 forward, FA2 forward, FA1 backward, FA2 backward.
+"""
+
+import os
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+
+import minitorch
+from minitorch import bench_utils
+from minitorch.cuda_kernel_ops import CudaKernelOps
+from minitorch.tensor_ops import TensorBackend
+from minitorch.tensor_functions import tensor_from_numpy
+import pycuda.autoinit
+
+backend = TensorBackend(CudaKernelOps)
+datatype = np.float32
+
+BATCH      = 4
+N_EMBD     = 64   # d = n_embd / n_head = 64
+N_HEAD     = 1
+SEQ_LENS   = [64, 128, 256, 512, 1024, 2048, 4096]
+N_ITERS    = 20
+N_WARMUP   = 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layer-level benchmark (Standard vs Flash MultiHeadAttention)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_layers(n_embd, n_head):
+    std_layer = minitorch.MultiHeadAttention(
+        n_embd, n_head, causal=False, p_dropout=0.0,
+        bias=False, backend=backend, use_flash_attn=False,
+    )
+    flash_layer = minitorch.MultiHeadAttention(
+        n_embd, n_head, causal=False, p_dropout=0.0,
+        bias=False, backend=backend, use_flash_attn=True,
+    )
+    rng = np.random.default_rng(0)
+    w = rng.standard_normal((n_embd, n_embd)).astype(datatype)
+    for layer in (std_layer, flash_layer):
+        for proj in (layer.q_projection, layer.k_projection,
+                     layer.v_projection, layer.out_projection):
+            t = tensor_from_numpy(w.copy(), backend=backend)
+            t.requires_grad_(True)
+            proj.weights.value = t
+    return std_layer, flash_layer
+
+
+def run_layer_benchmarks():
+    results = {
+        "std":   {"N": [], "fwd_time": [], "bwd_time": [], "fwd_mem": [], "bwd_mem": []},
+        "flash": {"N": [], "fwd_time": [], "bwd_time": [], "fwd_mem": [], "bwd_mem": []},
+    }
+
+    for N in SEQ_LENS:
+        print(f"\n[layer] N={N}")
+        std_layer, flash_layer = make_layers(N_EMBD, N_HEAD)
+
+        input_fn = lambda: tensor_from_numpy(
+            np.random.randn(BATCH, N, N_EMBD).astype(datatype),
+            backend=backend,
+        )
+
+        for tag, layer in (("std", std_layer), ("flash", flash_layer)):
+            print(f"  [{tag}]", end="", flush=True)
+            res = bench_utils.benchmark_module(layer, input_fn, n_iters=N_ITERS, n_warmup=N_WARMUP)
+            results[tag]["N"].append(N)
+            results[tag]["fwd_time"].append(res["fwd_time_ms"])
+            results[tag]["bwd_time"].append(res["bwd_time_ms"])
+            results[tag]["fwd_mem"].append(res["fwd_peak_mem_mb"])
+            results[tag]["bwd_mem"].append(res["bwd_peak_mem_mb"])
+            print(f"  fwd={res['fwd_time_ms']:.2f}ms  bwd={res['bwd_time_ms']:.2f}ms"
+                  f"  fwd_mem={res['fwd_peak_mem_mb']:.1f}MB  bwd_mem={res['bwd_peak_mem_mb']:.1f}MB")
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kernel-level benchmark (FA1 vs FA2 forward and backward)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _time_kernel(fn, n_iters, n_warmup):
+    """Run fn() n_warmup times, then time n_iters calls. Returns (ms, peak_mb)."""
+    for _ in range(n_warmup):
+        fn()
+
+    times = []
+    peak_mbs = []
+    for _ in range(n_iters):
+        pycuda.autoinit.context.synchronize()
+        poller = bench_utils.NvmlMemPoller()
+        poller.start()
+        t0 = time.perf_counter()
+        fn()
+        pycuda.autoinit.context.synchronize()
+        t1 = time.perf_counter()
+        poller.stop()
+        times.append(t1 - t0)
+        peak_mbs.append(poller.peak_mb)
+
+    return sum(times) / len(times) * 1000, max(peak_mbs)
+
+
+def run_kernel_benchmarks():
+    # BH = BATCH * N_HEAD = 4
+    BH = BATCH * N_HEAD
+
+    results = {
+        "fa1_fwd": {"N": [], "time": [], "mem": []},
+        "fa2_fwd": {"N": [], "time": [], "mem": []},
+        "fa1_bwd": {"N": [], "time": [], "mem": []},
+        "fa2_bwd": {"N": [], "time": [], "mem": []},
+    }
+
+    rng = np.random.default_rng(42)
+
+    for N in SEQ_LENS:
+        print(f"\n[kernel] N={N}")
+        scale = 64 ** -0.5
+
+        q_np  = rng.standard_normal((BH, N, 64)).astype(datatype)
+        k_np  = rng.standard_normal((BH, N, 64)).astype(datatype)
+        v_np  = rng.standard_normal((BH, N, 64)).astype(datatype)
+        do_np = rng.standard_normal((BH, N, 64)).astype(datatype)
+
+        q  = tensor_from_numpy(q_np,  backend=backend)
+        k  = tensor_from_numpy(k_np,  backend=backend)
+        v  = tensor_from_numpy(v_np,  backend=backend)
+        do = tensor_from_numpy(do_np, backend=backend)
+
+        # Run FA2 forward once to get O and L for backward benchmarks
+        o, L = CudaKernelOps.flash_attention_forward_fa2(q, k, v, scale)
+
+        # FA1 forward
+        ms, mb = _time_kernel(
+            lambda: CudaKernelOps.flash_attention_forward_fa1(q, k, v, scale),
+            N_ITERS, N_WARMUP,
+        )
+        results["fa1_fwd"]["N"].append(N)
+        results["fa1_fwd"]["time"].append(ms)
+        results["fa1_fwd"]["mem"].append(mb)
+        print(f"  [fa1_fwd]  {ms:.2f}ms  {mb:.1f}MB")
+
+        # FA2 forward
+        ms, mb = _time_kernel(
+            lambda: CudaKernelOps.flash_attention_forward_fa2(q, k, v, scale),
+            N_ITERS, N_WARMUP,
+        )
+        results["fa2_fwd"]["N"].append(N)
+        results["fa2_fwd"]["time"].append(ms)
+        results["fa2_fwd"]["mem"].append(mb)
+        print(f"  [fa2_fwd]  {ms:.2f}ms  {mb:.1f}MB")
+
+        # FA1 backward
+        ms, mb = _time_kernel(
+            lambda: CudaKernelOps.flash_attention_backward_fa1(q, k, v, o, do, L, scale),
+            N_ITERS, N_WARMUP,
+        )
+        results["fa1_bwd"]["N"].append(N)
+        results["fa1_bwd"]["time"].append(ms)
+        results["fa1_bwd"]["mem"].append(mb)
+        print(f"  [fa1_bwd]  {ms:.2f}ms  {mb:.1f}MB")
+
+        # FA2 backward
+        ms, mb = _time_kernel(
+            lambda: CudaKernelOps.flash_attention_backward_fa2(q, k, v, o, do, L, scale),
+            N_ITERS, N_WARMUP,
+        )
+        results["fa2_bwd"]["N"].append(N)
+        results["fa2_bwd"]["time"].append(ms)
+        results["fa2_bwd"]["mem"].append(mb)
+        print(f"  [fa2_bwd]  {ms:.2f}ms  {mb:.1f}MB")
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plotting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _plot_layer(results):
+    os.makedirs("benchmarking/layers", exist_ok=True)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(f"Standard vs Flash Attention  (B={BATCH}, d={N_EMBD}, n_head={N_HEAD})")
+
+    std   = results["std"]
+    flash = results["flash"]
+
+    axes[0].plot(std["N"],   std["fwd_time"],   marker="o", label="Standard fwd")
+    axes[0].plot(flash["N"], flash["fwd_time"], marker="s", label="Flash fwd")
+    axes[0].set_title("Forward Time")
+    axes[0].set_xlabel("Sequence Length N")
+    axes[0].set_ylabel("Time (ms)")
+    axes[0].legend(); axes[0].grid(True, linestyle="--", alpha=0.7)
+
+    axes[1].plot(std["N"],   std["bwd_time"],   marker="o", label="Standard bwd")
+    axes[1].plot(flash["N"], flash["bwd_time"], marker="s", label="Flash bwd")
+    axes[1].set_title("Backward Time")
+    axes[1].set_xlabel("Sequence Length N")
+    axes[1].set_ylabel("Time (ms)")
+    axes[1].legend(); axes[1].grid(True, linestyle="--", alpha=0.7)
+
+    axes[2].plot(std["N"],   std["fwd_mem"],   marker="o", linestyle="-",  label="Standard fwd mem")
+    axes[2].plot(std["N"],   std["bwd_mem"],   marker="o", linestyle="--", label="Standard bwd mem")
+    axes[2].plot(flash["N"], flash["fwd_mem"], marker="s", linestyle="-",  label="Flash fwd mem")
+    axes[2].plot(flash["N"], flash["bwd_mem"], marker="s", linestyle="--", label="Flash bwd mem")
+    axes[2].set_title("Peak GPU Memory")
+    axes[2].set_xlabel("Sequence Length N")
+    axes[2].set_ylabel("Memory (MB)")
+    axes[2].legend(); axes[2].grid(True, linestyle="--", alpha=0.7)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    out_path = "benchmarking/layers/flash_attention_benchmark.png"
+    plt.savefig(out_path)
+    plt.close(fig)
+    print(f"\nLayer plot saved to {out_path}")
+
+
+def _plot_kernels(results):
+    os.makedirs("benchmarking/layers", exist_ok=True)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(f"FA1 vs FA2 Kernel Benchmarks  (BH={BATCH * N_HEAD}, d=64)")
+
+    Ns = results["fa1_fwd"]["N"]
+
+    # Forward time
+    axes[0].plot(Ns, results["fa1_fwd"]["time"], marker="o", label="FA1 fwd")
+    axes[0].plot(Ns, results["fa2_fwd"]["time"], marker="s", label="FA2 fwd")
+    axes[0].set_title("Forward Time")
+    axes[0].set_xlabel("Sequence Length N")
+    axes[0].set_ylabel("Time (ms)")
+    axes[0].legend(); axes[0].grid(True, linestyle="--", alpha=0.7)
+
+    # Backward time
+    axes[1].plot(Ns, results["fa1_bwd"]["time"], marker="o", label="FA1 bwd (atomicAdd)")
+    axes[1].plot(Ns, results["fa2_bwd"]["time"], marker="s", label="FA2 bwd (two-kernel)")
+    axes[1].set_title("Backward Time")
+    axes[1].set_xlabel("Sequence Length N")
+    axes[1].set_ylabel("Time (ms)")
+    axes[1].legend(); axes[1].grid(True, linestyle="--", alpha=0.7)
+
+    # Peak memory — all four kernels
+    axes[2].plot(Ns, results["fa1_fwd"]["mem"], marker="o", linestyle="-",  label="FA1 fwd mem")
+    axes[2].plot(Ns, results["fa2_fwd"]["mem"], marker="s", linestyle="-",  label="FA2 fwd mem")
+    axes[2].plot(Ns, results["fa1_bwd"]["mem"], marker="o", linestyle="--", label="FA1 bwd mem")
+    axes[2].plot(Ns, results["fa2_bwd"]["mem"], marker="s", linestyle="--", label="FA2 bwd mem")
+    axes[2].set_title("Peak GPU Memory")
+    axes[2].set_xlabel("Sequence Length N")
+    axes[2].set_ylabel("Memory (MB)")
+    axes[2].legend(); axes[2].grid(True, linestyle="--", alpha=0.7)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    out_path = "benchmarking/layers/flash_attention_kernel_benchmark.png"
+    plt.savefig(out_path)
+    plt.close(fig)
+    print(f"Kernel plot saved to {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run():
+    print("=" * 60)
+    print("Layer-level: Standard vs Flash MultiHeadAttention")
+    print("=" * 60)
+    layer_results = run_layer_benchmarks()
+    _plot_layer(layer_results)
+
+    print("\n" + "=" * 60)
+    print("Kernel-level: FA1 vs FA2 forward and backward")
+    print("=" * 60)
+    kernel_results = run_kernel_benchmarks()
+    _plot_kernels(kernel_results)
+
+
+if __name__ == "__main__":
+    run()
