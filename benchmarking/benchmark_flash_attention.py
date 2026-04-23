@@ -4,8 +4,9 @@ Benchmark: Standard Attention vs Flash Attention (layer-level + kernel-level)
 Layer-level: sweeps sequence length N through MultiHeadAttention with
   use_flash_attn=False vs True, reporting fwd/bwd time and peak GPU memory.
 
-Kernel-level: directly times the four raw kernels:
-  FA1 forward, FA2 forward, FA1 backward, FA2 backward.
+Kernel-level: directly times the raw kernels:
+  Standard fwd, FA1 forward, FA2 forward,
+  Standard bwd (fwd+bwd cycle), FA1 backward, FA2 backward.
 """
 
 import os
@@ -18,6 +19,7 @@ from minitorch import bench_utils
 from minitorch.cuda_kernel_ops import CudaKernelOps
 from minitorch.tensor_ops import TensorBackend
 from minitorch.tensor_functions import tensor_from_numpy
+from minitorch.nn import softmax as minitorch_softmax
 import pycuda.autoinit
 
 backend = TensorBackend(CudaKernelOps)
@@ -114,9 +116,16 @@ def run_kernel_benchmarks():
     # BH = BATCH * N_HEAD = 4
     BH = BATCH * N_HEAD
 
+    # Build a standard (non-flash) attention layer for std_fwd / std_bwd timing.
+    # We call layer.self_attention() directly so projections are excluded and
+    # only the core softmax(Q @ K^T) @ V compute is measured.
+    std_layer, _ = make_layers(N_EMBD, N_HEAD)
+
     results = {
+        "std_fwd": {"N": [], "time": [], "mem": []},
         "fa1_fwd": {"N": [], "time": [], "mem": []},
         "fa2_fwd": {"N": [], "time": [], "mem": []},
+        "std_bwd": {"N": [], "time": [], "mem": []},
         "fa1_bwd": {"N": [], "time": [], "mem": []},
         "fa2_bwd": {"N": [], "time": [], "mem": []},
     }
@@ -137,8 +146,23 @@ def run_kernel_benchmarks():
         v  = tensor_from_numpy(v_np,  backend=backend)
         do = tensor_from_numpy(do_np, backend=backend)
 
-        # Run FA2 forward once to get O and L for backward benchmarks
+        # Reshape (BH, N, 64) → (BATCH, N_HEAD, N, 64) for self_attention()
+        q_4d  = q.view(BATCH, N_HEAD, N, 64)
+        kT_4d = k.view(BATCH, N_HEAD, N, 64).permute(0, 1, 3, 2)  # (B, H, 64, N)
+        v_4d  = v.view(BATCH, N_HEAD, N, 64)
+
+        # Run FA2 forward once to get O and L for flash backward benchmarks
         o, L = CudaKernelOps.flash_attention_forward_fa2(q, k, v, scale)
+
+        # Standard forward (uses layer.self_attention — no projections)
+        ms, mb = _time_kernel(
+            lambda: std_layer.self_attention(q_4d, kT_4d, v_4d),
+            N_ITERS, N_WARMUP,
+        )
+        results["std_fwd"]["N"].append(N)
+        results["std_fwd"]["time"].append(ms)
+        results["std_fwd"]["mem"].append(mb)
+        print(f"  [std_fwd]  {ms:.2f}ms  {mb:.1f}MB")
 
         # FA1 forward
         ms, mb = _time_kernel(
@@ -159,6 +183,25 @@ def run_kernel_benchmarks():
         results["fa2_fwd"]["time"].append(ms)
         results["fa2_fwd"]["mem"].append(mb)
         print(f"  [fa2_fwd]  {ms:.2f}ms  {mb:.1f}MB")
+
+        # Standard backward — fwd+bwd cycle (graph rebuilt each call)
+        def _std_bwd_cycle():
+            q_g  = tensor_from_numpy(q_np,  backend=backend)
+            k_g  = tensor_from_numpy(k_np,  backend=backend)
+            v_g  = tensor_from_numpy(v_np,  backend=backend)
+            q_g.requires_grad_(True); k_g.requires_grad_(True); v_g.requires_grad_(True)
+            q_g4  = q_g.view(BATCH, N_HEAD, N, 64)
+            kT_g4 = k_g.view(BATCH, N_HEAD, N, 64).permute(0, 1, 3, 2)
+            v_g4  = v_g.view(BATCH, N_HEAD, N, 64)
+            out = std_layer.self_attention(q_g4, kT_g4, v_g4)
+            do_t = tensor_from_numpy(do_np, backend=backend)
+            (out * do_t).sum().backward()
+
+        ms, mb = _time_kernel(_std_bwd_cycle, N_ITERS, N_WARMUP)
+        results["std_bwd"]["N"].append(N)
+        results["std_bwd"]["time"].append(ms)
+        results["std_bwd"]["mem"].append(mb)
+        print(f"  [std_bwd]  {ms:.2f}ms  {mb:.1f}MB  (fwd+bwd cycle)")
 
         # FA1 backward
         ms, mb = _time_kernel(
@@ -230,11 +273,12 @@ def _plot_kernels(results):
     os.makedirs("benchmarking/layers", exist_ok=True)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle(f"FA1 vs FA2 Kernel Benchmarks  (BH={BATCH * N_HEAD}, d=64)")
+    fig.suptitle(f"Standard vs FA1 vs FA2 Kernel Benchmarks  (BH={BATCH * N_HEAD}, d=64)")
 
     Ns = results["fa1_fwd"]["N"]
 
     # Forward time
+    axes[0].plot(Ns, results["std_fwd"]["time"], marker="^", label="Std fwd")
     axes[0].plot(Ns, results["fa1_fwd"]["time"], marker="o", label="FA1 fwd")
     axes[0].plot(Ns, results["fa2_fwd"]["time"], marker="s", label="FA2 fwd")
     axes[0].set_title("Forward Time")
@@ -243,6 +287,7 @@ def _plot_kernels(results):
     axes[0].legend(); axes[0].grid(True, linestyle="--", alpha=0.7)
 
     # Backward time
+    axes[1].plot(Ns, results["std_bwd"]["time"], marker="^", label="Std bwd (fwd+bwd)")
     axes[1].plot(Ns, results["fa1_bwd"]["time"], marker="o", label="FA1 bwd (atomicAdd)")
     axes[1].plot(Ns, results["fa2_bwd"]["time"], marker="s", label="FA2 bwd (two-kernel)")
     axes[1].set_title("Backward Time")
@@ -250,9 +295,11 @@ def _plot_kernels(results):
     axes[1].set_ylabel("Time (ms)")
     axes[1].legend(); axes[1].grid(True, linestyle="--", alpha=0.7)
 
-    # Peak memory — all four kernels
+    # Peak memory — all kernels
+    axes[2].plot(Ns, results["std_fwd"]["mem"], marker="^", linestyle="-",  label="Std fwd mem")
     axes[2].plot(Ns, results["fa1_fwd"]["mem"], marker="o", linestyle="-",  label="FA1 fwd mem")
     axes[2].plot(Ns, results["fa2_fwd"]["mem"], marker="s", linestyle="-",  label="FA2 fwd mem")
+    axes[2].plot(Ns, results["std_bwd"]["mem"], marker="^", linestyle="--", label="Std bwd mem")
     axes[2].plot(Ns, results["fa1_bwd"]["mem"], marker="o", linestyle="--", label="FA1 bwd mem")
     axes[2].plot(Ns, results["fa2_bwd"]["mem"], marker="s", linestyle="--", label="FA2 bwd mem")
     axes[2].set_title("Peak GPU Memory")
@@ -279,7 +326,7 @@ def run():
     _plot_layer(layer_results)
 
     print("\n" + "=" * 60)
-    print("Kernel-level: FA1 vs FA2 forward and backward")
+    print("Kernel-level: Standard vs FA1 vs FA2 forward and backward")
     print("=" * 60)
     kernel_results = run_kernel_benchmarks()
     _plot_kernels(kernel_results)
