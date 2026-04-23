@@ -1,6 +1,15 @@
 import numpy as np
 from .tensor import tensor, tensor_from_numpy
 from .module import Module, Parameter
+import numba
+
+_flash_attn_available = False
+try:
+    if numba.cuda.is_available():
+        from .cuda_kernel_ops import CudaKernelOps as _CudaKernelOps
+        _flash_attn_available = True
+except Exception:
+    pass
 from .modules_basic import (
     Embedding,
     Dropout,
@@ -21,7 +30,7 @@ datatype = np.float32
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None, use_flash_attn: bool=False):
         super().__init__()
         """Implements Multi-Head Attention as described in "Attention Is All You Need"
 
@@ -40,10 +49,11 @@ class MultiHeadAttention(Module):
             dropout: Dropout layer
         """
         self.backend = backend
-        self.n_embd = n_embd 
+        self.n_embd = n_embd
         self.n_head = n_head
         self.causal = causal
         self.attn_hidden_dim = n_embd // n_head
+        self.use_flash_attn = use_flash_attn and _flash_attn_available
 
         ### BEGIN ASSIGN3_3
         self.q_projection = Linear(n_embd, n_embd,bias,backend)
@@ -114,20 +124,29 @@ class MultiHeadAttention(Module):
         _, _, k_dim, _ = kT.shape
         _, _, _, v_dim = v.shape
         assert q_dim == k_dim == v_dim
-        result = None
-        
-        ### BEGIN ASSIGN3_3
-        
+
+        if self.use_flash_attn:
+            assert q_dim == 64, "flash attention is currently fixed to d=64"
+            assert not self.causal, "causal masking not yet supported in flash attention"
+            # kT is (B, H, d, N) — permute back to K (B, H, N, d)
+            k = kT.permute(0, 1, 3, 2)
+            BH = batch_size * num_head
+            q_flat = q.contiguous().view(BH, queries_len, q_dim)
+            k_flat = k.contiguous().view(BH, queries_len, q_dim)
+            v_flat = v.contiguous().view(BH, queries_len, q_dim)
+            out = _CudaKernelOps.flash_attention_forward(q_flat, k_flat, v_flat, q_dim ** -0.5)
+            out = out.view(batch_size, num_head, queries_len, q_dim)
+            out = out.permute(0, 2, 1, 3).contiguous()
+            return out.view(batch_size, queries_len, num_head * q_dim)
+
+        # Standard attention
         attn_weights = ((q @ kT) / (q_dim ** 0.5))
-        if(self.causal):
+        if self.causal:
             mask = self.create_causal_mask(queries_len)
             attn_weights += mask
-        result =  (softmax(attn_weights, dim = 3)) @ v
-        result = (result.permute(0,2,1,3)).contiguous()
-        result = result.view(batch_size, queries_len, num_head*q_dim)
-        ### END ASSIGN3_3
-
-        return result
+        result = (softmax(attn_weights, dim=3)) @ v
+        result = (result.permute(0, 2, 1, 3)).contiguous()
+        return result.view(batch_size, queries_len, num_head * q_dim)
 
     def forward(self, x):
         """

@@ -21,8 +21,9 @@ import numpy as np
 import pycuda.autoinit
 import pycuda.driver as cuda
 
-# Load the shared library
+# Load the shared libraries
 lib = ctypes.CDLL("minitorch/cuda_kernels/combine.so")
+lib_fa = ctypes.CDLL("minitorch/cuda_kernels/flash_attention_forward.so")
 datatype = np.float32
 
 # function map
@@ -367,4 +368,45 @@ class CudaKernelOps(TensorOps):
         if more_3d:
             out = out.view(*ls)
             # print(f"Debug in matmul: output shape {out.shape}")
+        return out
+
+    @staticmethod
+    def flash_attention_forward(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
+        """
+        Flash Attention forward pass (d=64 fixed).
+
+        Args:
+            q, k, v : contiguous tensors of shape (BH, N, 64)
+                      where BH = batch_size * num_heads
+            scale   : 1 / sqrt(d), precomputed
+
+        Returns:
+            out : tensor of shape (BH, N, 64)
+        """
+        assert len(q.shape) == 3 and q.shape[2] == 64, \
+            f"flash_attention_forward expects (BH, N, 64), got {q.shape}"
+
+        BH, N, d = q.shape
+        out = q.zeros(q.shape)
+
+        lib_fa.flashAttentionForward.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # Q
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # K
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # V
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),  # O
+            ctypes.c_int,    # BH
+            ctypes.c_int,    # N
+            ctypes.c_float,  # scale
+        ]
+        lib_fa.flashAttentionForward.restype = None
+
+        lib_fa.flashAttentionForward(
+            q._tensor._storage,
+            k._tensor._storage,
+            v._tensor._storage,
+            out._tensor._storage,
+            BH,
+            N,
+            scale,
+        )
         return out

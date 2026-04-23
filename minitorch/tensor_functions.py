@@ -748,11 +748,10 @@ def ones_tensor_from_numpy(shape, backend: TensorBackend = SimpleBackend):
 # Gradient check for tensors
 
 
-import torch
-
 def grad_central_difference(
     f: Any, *vals: Tensor, arg: int = 0, epsilon: float = 1e-6, ind: UserIndex
 ) -> float:
+    import torch
     x = vals[arg]
     up_np = np.zeros(x.shape, dtype=np.float64)
     up_np[ind] = epsilon
