@@ -8,6 +8,7 @@ try:
     if numba.cuda.is_available():
         from .cuda_kernel_ops import CudaKernelOps as _CudaKernelOps
         from .flash_attention_fn import FlashAttentionFn as _FlashAttentionFn
+        from .flash_attention_fn import FlashAttentionFnFA1 as _FlashAttentionFnFA1
         _flash_attn_available = True
 except Exception:
     pass
@@ -31,7 +32,7 @@ datatype = np.float32
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None, use_flash_attn: bool=False):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=False, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None, use_flash_attn: bool=False, attn_type: str="standard"):
         super().__init__()
         """Implements Multi-Head Attention as described in "Attention Is All You Need"
 
@@ -41,7 +42,8 @@ class MultiHeadAttention(Module):
             p_dropout: Dropout ratio for dropout layer
             causal: If True, then apply a causal mask during self-attention
             bias: If True, then apply a bias in Linear layers
-        
+            attn_type: "standard", "fa1", or "fa2" (overrides use_flash_attn)
+
         Attributes:
             q_projection: Linear layer projecting input to Q matrix
             k_projection: Linear layer projecting input to K matrix
@@ -54,7 +56,13 @@ class MultiHeadAttention(Module):
         self.n_head = n_head
         self.causal = causal
         self.attn_hidden_dim = n_embd // n_head
-        self.use_flash_attn = use_flash_attn and _flash_attn_available
+        if attn_type == "fa2":
+            self.attn_type = "fa2" if _flash_attn_available else "standard"
+        elif attn_type == "fa1":
+            self.attn_type = "fa1" if _flash_attn_available else "standard"
+        else:
+            self.attn_type = "fa2" if (use_flash_attn and _flash_attn_available) else "standard"
+        self.use_flash_attn = (self.attn_type == "fa2")
 
         ### BEGIN ASSIGN3_3
         self.q_projection = Linear(n_embd, n_embd,bias,backend)
@@ -126,7 +134,7 @@ class MultiHeadAttention(Module):
         _, _, _, v_dim = v.shape
         assert q_dim == k_dim == v_dim
 
-        if self.use_flash_attn:
+        if self.attn_type in ("fa1", "fa2"):
             assert q_dim == 64, "flash attention is currently fixed to d=64"
             assert not self.causal, "causal masking not yet supported in flash attention"
             # kT is (B, H, d, N) — permute back to K (B, H, N, d)
@@ -135,7 +143,8 @@ class MultiHeadAttention(Module):
             q_flat = q.contiguous().view(BH, queries_len, q_dim)
             k_flat = k.contiguous().view(BH, queries_len, q_dim)
             v_flat = v.contiguous().view(BH, queries_len, q_dim)
-            out = _FlashAttentionFn.apply(q_flat, k_flat, v_flat)
+            fn = _FlashAttentionFnFA1 if self.attn_type == "fa1" else _FlashAttentionFn
+            out = fn.apply(q_flat, k_flat, v_flat)
             out = out.view(batch_size, num_head, queries_len, q_dim)
             out = out.permute(0, 2, 1, 3).contiguous()
             return out.view(batch_size, queries_len, num_head * q_dim)
@@ -214,11 +223,11 @@ class FeedForward(Module):
     
 
 class TransformerLayer(Module):
-    def __init__(self, n_embd: int, n_head: int, causal: bool=True, p_dropout: float=0.1, ln_eps: float=1e-5, bias: bool=True, backend: TensorBackend=None):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=True, p_dropout: float=0.1, ln_eps: float=1e-5, bias: bool=True, backend: TensorBackend=None, attn_type: str="standard"):
         super().__init__()
         """
         Initialize a transformer layer with pre-layer normalization.
-        
+
         Args:
             n_embd (int): Embedding dimension
             n_head (int): Number of attention heads
@@ -227,7 +236,8 @@ class TransformerLayer(Module):
             ln_eps (float): Layer normalization epsilon, default 1e-5
             bias (bool): Whether to use bias in linear layers, default True
             backend (TensorBackend): Backend for tensor operations
-            
+            attn_type (str): "standard", "fa1", or "fa2"
+
         Attributes:
             ln_1 (LayerNorm1d): First layer normalization before attention
             ln_2 (LayerNorm1d): Second layer normalization after attention
@@ -237,7 +247,7 @@ class TransformerLayer(Module):
         ### BEGIN ASSIGN3_3
         self.ln_1 = LayerNorm1d(n_embd,ln_eps,backend)
         self.ln_2 = LayerNorm1d(n_embd,ln_eps,backend)
-        self.attention = MultiHeadAttention(n_embd, n_head, False, p_dropout, bias, backend)
+        self.attention = MultiHeadAttention(n_embd, n_head, False, p_dropout, bias, backend, attn_type=attn_type)
         self.ff = FeedForward(n_embd,  4 * n_embd, p_dropout, bias, backend)
         ### END ASSIGN3_3
 
@@ -384,18 +394,19 @@ class Patchify(Module):
         
 class ViT(Module):
     def __init__(
-        self, 
+        self,
         n_embd: int,
         n_head: int,
         p_dropout: float=0.1,
-        ln_eps: float=1e-5, 
+        ln_eps: float=1e-5,
         bias: bool=True,
         patch_size: int=16,
         n_trans_layers: int=12,
         n_classes: int=1000,
         max_patches: int=1000,
         n_channels: int=3,
-        backend: TensorBackend=None
+        backend: TensorBackend=None,
+        attn_type: str="standard",
     ):
         super().__init__()
         self.backend = backend
@@ -414,7 +425,7 @@ class ViT(Module):
         self.trans_layers = []
         for i in range(n_trans_layers):
             layer = TransformerLayer(
-                n_embd, n_head, False, p_dropout, ln_eps, bias, backend
+                n_embd, n_head, False, p_dropout, ln_eps, bias, backend, attn_type=attn_type
             )
             self.trans_layers.append(layer)
 

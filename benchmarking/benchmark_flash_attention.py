@@ -28,9 +28,9 @@ datatype = np.float32
 BATCH      = 4
 N_EMBD     = 64   # d = n_embd / n_head = 64
 N_HEAD     = 1
-SEQ_LENS   = [64, 128, 256, 512, 1024, 2048, 4096]
-N_ITERS    = 20
-N_WARMUP   = 5
+SEQ_LENS   = [64, 128] #256, 512, 1024, 2048, 4096]
+N_ITERS    = 5
+N_WARMUP   = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,6 +315,135 @@ def _plot_kernels(results):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Image-resolution benchmark (Std vs FA1 vs FA2 MHA, sweeping image size)
+# ─────────────────────────────────────────────────────────────────────────────
+
+IMAGE_SIZES = [128, 256, 512, 1024]   # square image side length
+PATCH_SIZE  = 16                       # ViT patch size → N = (img // patch)^2
+
+
+# Thin autograd wrapper for FA1 (mirrors flash_attention_fn.py for FA2)
+from minitorch.autodiff import Context
+from minitorch.tensor_functions import Function as _Fn
+
+class _FA1Fn(_Fn):
+    @staticmethod
+    def forward(ctx: Context, q, k, v):
+        scale = q.shape[2] ** -0.5
+        o, L  = CudaKernelOps.flash_attention_forward_fa1(q, k, v, scale)
+        ctx.save_for_backward(q, k, v, o, L, scale)
+        return o
+
+    @staticmethod
+    def backward(ctx: Context, do):
+        q, k, v, o, L, scale = ctx.saved_values
+        dq, dk, dv = CudaKernelOps.flash_attention_backward_fa1(q, k, v, o, do, L, scale)
+        return dq, dk, dv
+
+
+class _FA1AttentionLayer(minitorch.Module):
+    """Wraps an existing MHA layer but swaps the attention kernel to FA1."""
+    def __init__(self, mha_layer):
+        super().__init__()
+        self._mha = mha_layer
+
+    def forward(self, x):
+        batch_size, seq_len, n_embd = x.shape
+        q, kT, v = self._mha.project_to_query_key_value(x)
+        # q: (B,H,N,d)  kT: (B,H,d,N)  v: (B,H,N,d)
+        k   = kT.permute(0, 1, 3, 2)
+        BH  = batch_size * self._mha.n_head
+        d   = self._mha.attn_hidden_dim
+        q_f = q.contiguous().view(BH, seq_len, d)
+        k_f = k.contiguous().view(BH, seq_len, d)
+        v_f = v.contiguous().view(BH, seq_len, d)
+        out = _FA1Fn.apply(q_f, k_f, v_f)
+        out = out.view(batch_size, self._mha.n_head, seq_len, d)
+        out = out.permute(0, 2, 1, 3).contiguous()
+        return out.view(batch_size, seq_len, n_embd)
+
+
+def run_image_benchmarks():
+    results = {
+        "std":   {"img": [], "fwd_time": [], "bwd_time": [], "fwd_mem": [], "bwd_mem": []},
+        "fa1":   {"img": [], "fwd_time": [], "bwd_time": [], "fwd_mem": [], "bwd_mem": []},
+        "flash": {"img": [], "fwd_time": [], "bwd_time": [], "fwd_mem": [], "bwd_mem": []},
+    }
+
+    for img_size in IMAGE_SIZES:
+        N = (img_size // PATCH_SIZE) ** 2
+        print(f"\n[image] {img_size}x{img_size}  (N={N})")
+
+        std_layer, flash_layer = make_layers(N_EMBD, N_HEAD)
+        fa1_layer = _FA1AttentionLayer(std_layer)
+
+        input_fn = lambda: tensor_from_numpy(
+            np.random.randn(BATCH, N, N_EMBD).astype(datatype),
+            backend=backend,
+        )
+
+        for tag, layer in (("std", std_layer), ("fa1", fa1_layer), ("flash", flash_layer)):
+            print(f"  [{tag}]", end="", flush=True)
+            res = bench_utils.benchmark_module(layer, input_fn, n_iters=N_ITERS, n_warmup=N_WARMUP)
+            results[tag]["img"].append(img_size)
+            results[tag]["fwd_time"].append(res["fwd_time_ms"])
+            results[tag]["bwd_time"].append(res["bwd_time_ms"])
+            results[tag]["fwd_mem"].append(res["fwd_peak_mem_mb"])
+            results[tag]["bwd_mem"].append(res["bwd_peak_mem_mb"])
+            print(f"  fwd={res['fwd_time_ms']:.2f}ms  bwd={res['bwd_time_ms']:.2f}ms"
+                  f"  fwd_mem={res['fwd_peak_mem_mb']:.1f}MB  bwd_mem={res['bwd_peak_mem_mb']:.1f}MB")
+
+    return results
+
+
+def _plot_image_benchmarks(results):
+    os.makedirs("benchmarking/layers", exist_ok=True)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(
+        f"Std vs FA1 vs FA2 — MHA by Image Resolution  "
+        f"(B={BATCH}, patch={PATCH_SIZE}, d={N_EMBD}, n_head={N_HEAD})"
+    )
+
+    xlabels = [f"{s}×{s}" for s in results["std"]["img"]]
+    xs      = results["std"]["img"]
+
+    for tag, marker, label in (
+        ("std",   "^", "Standard"),
+        ("fa1",   "o", "FA1"),
+        ("flash", "s", "FA2 (flash)"),
+    ):
+        axes[0].plot(xs, results[tag]["fwd_time"], marker=marker, label=label)
+        axes[1].plot(xs, results[tag]["bwd_time"], marker=marker, label=label)
+
+    axes[0].set_yscale("log"); axes[1].set_yscale("log")
+    for ax, title in zip(axes[:2], ["Forward Time (ms)", "Backward Time (ms)"]):
+        ax.set_title(title); ax.set_xlabel("Image Resolution")
+        ax.set_xticks(xs); ax.set_xticklabels(xlabels)
+        ax.legend(); ax.grid(True, linestyle="--", alpha=0.7)
+
+    # Speedup: std / fa1 and std / fa2
+    std_fwd  = np.array(results["std"]["fwd_time"])
+    std_bwd  = np.array(results["std"]["bwd_time"])
+    for tag, marker, label in (("fa1", "o", "vs FA1"), ("flash", "s", "vs FA2")):
+        axes[2].plot(xs, std_fwd / np.array(results[tag]["fwd_time"]),
+                     marker=marker, linestyle="-",  label=f"fwd speedup {label}")
+        axes[2].plot(xs, std_bwd / np.array(results[tag]["bwd_time"]),
+                     marker=marker, linestyle="--", label=f"bwd speedup {label}")
+    axes[2].axhline(1.0, color="gray", linestyle=":", linewidth=1)
+    axes[2].set_title("Speedup over Standard (std / flash)")
+    axes[2].set_xlabel("Image Resolution")
+    axes[2].set_xticks(xs); axes[2].set_xticklabels(xlabels)
+    axes[2].legend(); axes[2].grid(True, linestyle="--", alpha=0.7)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    out_path = "benchmarking/layers/image_resolution_benchmark.png"
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"\nImage resolution plot saved to {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -330,6 +459,12 @@ def run():
     print("=" * 60)
     kernel_results = run_kernel_benchmarks()
     _plot_kernels(kernel_results)
+
+    print("\n" + "=" * 60)
+    print("Image-resolution: Std vs FA1 vs FA2 MHA by image size")
+    print("=" * 60)
+    image_results = run_image_benchmarks()
+    _plot_image_benchmarks(image_results)
 
 
 if __name__ == "__main__":
